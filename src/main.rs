@@ -1,23 +1,22 @@
 use argh::FromArgs;
 use reqwest;
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt}};
 use std::path::Path;
 use hound;
-use rubato::{FftFixedInOut, Resampler};
+use rubato::{Fft, FixedSync, Resampler, audioadapter_buffers::owned::InterleavedOwned};
 use minimp3::{Decoder, Frame, Error};
 use lewton::inside_ogg::OggStreamReader;
-use std::convert::TryInto;
 use std::io::Cursor;
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
 
 /// Async command-line tool for Whisper ASR with auto model download
 #[derive(FromArgs)]
 struct Args {
-    /// model to use (e.g., tiny, base, small, medium, large)
+    /// model to use (e.g., tiny, base, small.en, medium, large-v3, large-v3-turbo)
     #[argh(option, default = "String::from(\"base\")")]
     model: String,
 
-    /// quantization level to use (e.g., q4_0, q5_0, q8_0). Default: no quantization.
+    /// quantization level to use (q5_0, q5_1, or q8_0). Default: no quantization.
     #[argh(option, default = "String::new()")]
     quant: String,
 
@@ -40,6 +39,14 @@ struct Args {
     /// include timestamps in the output
     #[argh(switch)]
     timestamps: bool,
+
+    /// use GPU acceleration (requires a build with the cuda or vulkan feature)
+    #[argh(switch)]
+    gpu: bool,
+
+    /// GPU device index to use
+    #[argh(option, default = "0")]
+    gpu_device: i32,
 }
 
 #[tokio::main]
@@ -62,13 +69,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args.quant.is_empty() { "none" } else { &args.quant });
 
     // Load the whisper context with the model
-    let ctx = WhisperContext::new_with_params(
-        &model_path,
-        WhisperContextParameters {
-            flash_attn: true,
-            ..Default::default()
-        }
-    ).expect("Failed to load model");
+    let mut ctx_params = WhisperContextParameters {
+        flash_attn: true,
+        ..Default::default()
+    };
+
+    if args.gpu {
+        #[cfg(not(any(feature = "cuda", feature = "vulkan")))]
+        println!("Warning: --gpu ignored, this build has no GPU backend. Rebuild with --features cuda or --features vulkan.");
+        ctx_params.use_gpu(true).gpu_device(args.gpu_device);
+    }
+
+    let ctx = WhisperContext::new_with_params(&model_path, ctx_params)
+        .expect("Failed to load model");
     
     // Create processing parameters
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -82,6 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.translate {
         params.set_translate(true);
     }
+
+    // Enable talk diarization for tdrz models
+    if args.model.ends_with("-tdrz") {
+        params.set_tdrz_enable(true);
+    }
     
     // Run transcription
     let mut state = ctx.create_state().expect("Failed to create state");
@@ -91,30 +109,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Transcription complete!");
     
     // Extract results
-    let num_segments = state.full_n_segments()
-        .expect("Failed to get number of segments");
-    
+    let num_segments = state.full_n_segments();    
     let mut full_text = String::new();
     
     // Extract results with or without timestamps based on the flag
     for i in 0..num_segments {
-        let segment_text = state.full_get_segment_text(i)
-            .expect("Failed to get segment text");
+        let segment = state
+            .get_segment(i)
+            .expect("Failed to get segment");
+        let segment_text = segment.to_str()?;
         
         if args.timestamps {
-            let start_timestamp = state.full_get_segment_t0(i)
-                .expect("Failed to get segment start timestamp");
-            let end_timestamp = state.full_get_segment_t1(i)
-                .expect("Failed to get segment end timestamp");
-            
-            // Format timestamps with explicit casting to ensure correct types
-            let start_mins = (start_timestamp as f64 / 60.0) as i64;
-            let start_secs = (start_timestamp as f64 % 60.0) as i64;
-            let start_millis = ((start_timestamp as f64 * 1000.0) % 1000.0) as i64;
-            
-            let end_mins = (end_timestamp as f64 / 60.0) as i64;
-            let end_secs = (end_timestamp as f64 % 60.0) as i64;
-            let end_millis = ((end_timestamp as f64 * 1000.0) % 1000.0) as i64;
+            // Timestamps are in centiseconds (10s of milliseconds)
+            let start_ms = segment.start_timestamp() * 10;
+            let end_ms = segment.end_timestamp() * 10;
+
+            let start_mins = start_ms / 60_000;
+            let start_secs = (start_ms / 1000) % 60;
+            let start_millis = start_ms % 1000;
+
+            let end_mins = end_ms / 60_000;
+            let end_secs = (end_ms / 1000) % 60;
+            let end_millis = end_ms % 1000;
             
             full_text.push_str(&format!(
                 "[{:02}:{:02}.{:03} - {:02}:{:02}.{:03}] {}\n",
@@ -140,29 +156,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Available ggml models and their SHA-1 checksums.
+const MODELS: &[(&str, &str)] = &[
+    ("tiny", "bd577a113a864445d4c299885e0cb97d4ba92b5f"),
+    ("tiny-q5_1", "2827a03e495b1ed3048ef28a6a4620537db4ee51"),
+    ("tiny-q8_0", "19e8118f6652a650569f5a949d962154e01571d9"),
+    ("tiny.en", "c78c86eb1a8faa21b369bcd33207cc90d64ae9df"),
+    ("tiny.en-q5_1", "3fb92ec865cbbc769f08137f22470d6b66e071b6"),
+    ("tiny.en-q8_0", "802d6668e7d411123e672abe4cb6c18f12306abb"),
+    ("base", "465707469ff3a37a2b9b8d8f89f2f99de7299dac"),
+    ("base-q5_1", "a3733eda680ef76256db5fc5dd9de8629e62c5e7"),
+    ("base-q8_0", "7bb89bb49ed6955013b9c20ae49423c94a20fbe"),
+    ("base.en", "137c40403d78fd54d454da0f9bd998f78703390c"),
+    ("base.en-q5_1", "d26d7ce5a1b6e57bea5d0431b9c20ae49423c94a"),
+    ("base.en-q8_0", "bb1574182e9b924452bf0cd1510ac034d323e948"),
+    ("small", "55356645c2b361a969dfd0ef2c5a50d530afd8d5"),
+    ("small-q5_1", "6fe57ddcfdd1c6b07cdcc73aaf620810ce5fc771"),
+    ("small-q8_0", "bcad8a2083f4e53d648d586b7dbc0cd673d8afad"),
+    ("small.en", "db8a495a91d927739e50b3fc1cc4c6b8f6c2d022"),
+    ("small.en-q5_1", "20f54878d608f94e4a8ee3ae56016571d47cba34"),
+    ("small.en-q8_0", "9d75ff4ccfa0a8217870d7405cf8cef0a5579852"),
+    ("small.en-tdrz", "b6c6e7e89af1a35c08e6de56b66ca6a02a2fdfa1"),
+    ("medium", "fd9727b6e1217c2f614f9b698455c4ffd82463b4"),
+    ("medium-q5_0", "7718d4c1ec62ca96998f058114db98236937490e"),
+    ("medium-q8_0", "e66645948aff4bebbec71b3485c576f3d63af5d6"),
+    ("medium.en", "8c30f0e44ce9560643ebd10bbe50cd20eafd3723"),
+    ("medium.en-q5_0", "bb3b5281bddd61605d6fc76bc5b92d8f20284c3b"),
+    ("medium.en-q8_0", "b1cf48c12c807e14881f634fb7b6c6ca867f6b38"),
+    ("large-v1", "b1caaf735c4cc1429223d5a74f0f4d0b9b59a299"),
+    ("large-v2", "0f4c8e34f21cf1a914c59d8b3ce882345ad349d6"),
+    ("large-v2-q5_0", "00e39f2196344e901b3a2bd5814807a769bd1630"),
+    ("large-v2-q8_0", "da97d6ca8f8ffbeeb5fd147f79010eeea194ba38"),
+    ("large-v3", "ad82bf6a9043ceed055076d0fd39f5f186ff8062"),
+    ("large-v3-q5_0", "e6e2ed78495d403bef4b7cff42ef4aaadcfea8de"),
+    ("large-v3-turbo", "4af2b29d7ec73d781377bfd1758ca957a807e941"),
+    ("large-v3-turbo-q5_0", "e050f7970618a659205450ad97eb95a18d69c9ee"),
+    ("large-v3-turbo-q8_0", "01bf15bedffe9f39d65c1b6ff9b687ea91f59e0e"),
+];
+
+fn find_model_sha(name: &str) -> Option<&'static str> {
+    MODELS
+        .iter()
+        .find(|(model, _)| *model == name)
+        .map(|(_, sha)| *sha)
+}
+
 /// Downloads a model if it is not already cached and returns its local path.
 async fn resolve_and_download_model(
     model_name: &str,
     quantization: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
-    let model_url_map = vec!["tiny", "base", "small", "medium", "large"];
 
-    // Validate model name
-    if !model_url_map.contains(&model_name) {
-        return Err(format!(
-            "Invalid model name. Use one of: {}",
-            model_url_map.join(", ")
-        )
-        .into());
-    }
-
-    // Construct model filename with optional quantization
-    let model_filename = if quantization.is_empty() {
-        format!("ggml-{}.bin", model_name)
+    let full_name = if quantization.is_empty() {
+        model_name.to_string()
     } else {
-        format!("ggml-{}-{}.bin", model_name, quantization)
+        format!("{}-{}", model_name, quantization)
     };
+
+    // Validate model against the known lineup
+    let expected_sha = find_model_sha(&full_name).ok_or_else(|| {
+        format!(
+            "Invalid model '{}'. Available models: {}",
+            full_name,
+            MODELS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    let model_filename = format!("ggml-{}.bin", full_name);
 
     // Define cache directory
     let cache_dir = dirs::cache_dir()
@@ -172,39 +237,77 @@ async fn resolve_and_download_model(
 
     let model_path = cache_dir.join(&model_filename);
 
-    // Check if the model is already cached
-    if !model_path.exists() {
-        println!("Downloading model '{}' (quant: '{}')...",
-            model_name, 
-            if quantization.is_empty() { "none" } else { quantization });
-        
-        let model_url = format!("{}{}", MODEL_BASE_URL, model_filename);
-
-        // Download the model
-        let response = reqwest::get(&model_url).await?;
-        if response.status().is_success() {
-            let total_size = response.content_length().unwrap_or(0);
-            println!("Downloading {} bytes...", total_size);
-            
-            let bytes = response.bytes().await?;
-            
-            let mut file = fs::File::create(&model_path).await?;
-            file.write_all(&bytes).await?;
-            
-            println!("Model '{}' downloaded successfully.", model_filename);
-        } else {
-            return Err(format!(
-                "Failed to download model from '{}': {}",
-                model_url,
-                response.status()
-            )
-            .into());
-        }
-    } else {
+    // Check if the model is already cached and valid
+    if model_path.exists() && verify_sha1(&model_path, expected_sha).await? {
         println!("Model '{}' already cached.", model_filename);
+        return Ok(model_path.to_string_lossy().into_owned());
     }
 
+    if model_path.exists() {
+        println!(
+            "Cached model '{}' failed checksum verification, re-downloading.",
+            model_filename
+        );
+    } else {
+        println!("Downloading model '{}'...", model_filename);
+    }
+
+    let model_url = format!("{}{}", MODEL_BASE_URL, model_filename);
+
+    // Download the model
+    let response = reqwest::get(&model_url).await?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to download model from '{}': {}",
+            model_url,
+            response.status()
+        )
+        .into());
+    }
+
+    let total_size = response.content_length().unwrap_or(0);
+    println!("Downloading {} bytes...", total_size);
+
+    let bytes = response.bytes().await?;
+
+    // Verify the checksum before writing to the cache
+    let actual_sha = sha1_hex(&bytes);
+    if actual_sha != expected_sha {
+        return Err(format!(
+            "Checksum mismatch for '{}': expected {}, got {}",
+            model_url, expected_sha, actual_sha
+        )
+        .into());
+    }
+
+    let mut file = fs::File::create(&model_path).await?;
+    file.write_all(&bytes).await?;
+
+    println!("Model '{}' downloaded successfully.", model_filename);
+
     Ok(model_path.to_string_lossy().into_owned())
+}
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+async fn verify_sha1(path: &Path, expected_sha: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    let mut file = fs::File::open(path).await?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buffer).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()) == expected_sha)
 }
 
 /// Parses an audio file into a vector of floating-point samples (16 kHz, mono).
@@ -253,14 +356,7 @@ async fn parse_wav_data(file_path: &str) -> Result<Vec<f32>, Box<dyn std::error:
     }
 
     if spec.sample_rate != 16_000 {
-        let mut resampler =
-            FftFixedInOut::<f32>::new(spec.sample_rate.try_into().unwrap(), 16_000, 1024, 2)?;
-        let resampled = resampler
-            .process(&[samples], None)?
-            .into_iter()
-            .flatten()
-            .collect();
-        return Ok(resampled);
+        return Ok(resample_to_16k(samples, spec.sample_rate)?);
     }
 
     Ok(samples)
@@ -307,18 +403,7 @@ async fn parse_mp3_data(file_path: &str) -> Result<Vec<f32>, Box<dyn std::error:
     }
 
     if sample_rate != 16_000 {
-        let mut resampler = FftFixedInOut::<f32>::new(
-            sample_rate.try_into().unwrap(),
-            16_000,
-            1024,
-            2,
-        )?;
-        let resampled = resampler
-            .process(&[samples], None)?
-            .into_iter()
-            .flatten()
-            .collect();
-        return Ok(resampled);
+        return Ok(resample_to_16k(samples, sample_rate as u32)?);
     }
 
     Ok(samples)
@@ -355,19 +440,18 @@ async fn parse_ogg_data(file_path: &str) -> Result<Vec<f32>, Box<dyn std::error:
     
     // Resample if necessary
     if reader.ident_hdr.audio_sample_rate != 16_000 {
-        let mut resampler = FftFixedInOut::<f32>::new(
-            reader.ident_hdr.audio_sample_rate.try_into().unwrap(),
-            16_000,
-            1024,
-            2,
-        )?;
-        let resampled = resampler
-            .process(&[samples], None)?
-            .into_iter()
-            .flatten()
-            .collect();
-        return Ok(resampled);
+        return Ok(resample_to_16k(samples, reader.ident_hdr.audio_sample_rate as u32)?);
     }
     
     Ok(samples)
+}
+
+/// Resamples mono f32 samples from the given sample rate to 16 kHz.
+fn resample_to_16k(samples: Vec<f32>, sample_rate: u32) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let frames = samples.len();
+    let input = InterleavedOwned::new_from(samples, 1, frames)?;
+    let mut resampler =
+        Fft::<f32>::new(sample_rate as usize, 16_000, 1024, 1, FixedSync::Input)?;
+    let output = resampler.process_all(&input, frames, None)?;
+    Ok(output.take_data())
 }
